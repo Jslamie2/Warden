@@ -4,17 +4,20 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from google import genai
+import os
 import time
 # Initialize the driver (Chrome example)
+import os
+from dotenv import load_dotenv
+
 
 
 USERNAME = "root"
 PASSWORD = "root"
-
 def get_stats_and_serial(miner_ip):
     rate_sale = "N/A"
     serial_number = "N/A"
-
     try:
         # 🔍 1. Get rate_sale
         stats_url = f"http://{miner_ip}/cgi-bin/stats.cgi"
@@ -35,30 +38,44 @@ def get_stats_and_serial(miner_ip):
         serial_number = sys_data.get("serinum", "N/A")
 
     except Exception as e:
-        print(f"❌ {miner_ip} - Error: {e}")
+        print(f"error: {miner_ip} - Error: {e}")
         return [miner_ip, "ERROR", str(e)]
     
 
-def get_log():
-    driver = webdriver.Chrome()
-    last_log_content = ""  # Track what we've already seen
-
+def llm(max_chars=500,prompt=None):
+    client = genai.Client(api_key="AIzaSyA1o9zGH1rHkbILGf88f65UWPKn4vI8Ux0")
+    token_limit = max_chars // 4 
     try:
-        url = "http://root:root@10.95.47.132/#blog"
+        chat = client.chats.create(
+            model="gemma-3-4b-it",
+            config={'max_output_tokens': token_limit}
+        )
+        constrained_prompt = f"You are an antminer expert reading the log of a asic antminer{prompt})"
+        res = chat.send_message(constrained_prompt)
+        return  res.text
+    except:
+        return " model config failed"
+
+      
+def get_log(url):
+    driver = webdriver.Chrome()
+    last_log_content = ""
+    try:
         driver.get(url)
         wait = WebDriverWait(driver, 20)
         log_element = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "log-content")))
         print("--- Started Real-Time Monitoring (Press Ctrl+C to stop) ---")
 
+        
         while True:
             current_full_text = log_element.text
             if current_full_text != last_log_content:
                 new_data = current_full_text[len(last_log_content):]
+
                 if new_data:
-                    print(new_data, end="") # Print new lines as they appear
+                    # print(new_data, end="") # Print new lines as they appear
                     with open("miner_log.txt", "a", encoding="utf-8") as f:
                         f.write(new_data)
-                
                 last_log_content = current_full_text
             time.sleep(2) 
 
@@ -68,5 +85,5 @@ def get_log():
         print(f"An error occurred: {e}")
     finally:
         driver.quit()
-
-get_log()
+url = "http://root:root@10.95.241.36/#blog"
+get_log(url)
