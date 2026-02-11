@@ -13,9 +13,8 @@ from dotenv import load_dotenv
 
 
 
-USERNAME = "root"
-PASSWORD = "root"
-def get_stats_and_serial(miner_ip):
+
+def get_stats_and_serial(miner_ip,USERNAME,PASSWORD):
     rate_sale = "N/A"
     serial_number = "N/A"
     try:
@@ -85,5 +84,3 @@ def get_log(url):
         print(f"An error occurred: {e}")
     finally:
         driver.quit()
-url = "http://root:root@10.95.241.36/#blog"
-get_log(url)
