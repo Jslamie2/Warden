@@ -12,6 +12,10 @@ import os
 from dotenv import load_dotenv
 
 
+load_dotenv()
+api_key = os.getenv("API")
+
+
 
 
 def get_stats_and_serial(miner_ip,USERNAME,PASSWORD):
@@ -43,7 +47,7 @@ def get_stats_and_serial(miner_ip,USERNAME,PASSWORD):
 #note the api_key is free so using it doesn't harm me in anyway.
 #Iam prototyping this so yh I dont normally leave my api keys hanging in prod
 def llm(max_chars=200,prompt=None):
-    api_key = os.getenv("API")
+    
     client = genai.Client(api_key=api_key)
    
     try:
