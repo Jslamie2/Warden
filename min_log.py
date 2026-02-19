@@ -41,46 +41,57 @@ def get_stats_and_serial(miner_ip,USERNAME,PASSWORD):
         return [miner_ip, "ERROR", str(e)]
     
 
-def llm(max_chars=500,prompt=None):
+def llm(max_chars=200,prompt=None):
     client = genai.Client(api_key="AIzaSyA1o9zGH1rHkbILGf88f65UWPKn4vI8Ux0")
-    token_limit = max_chars // 4 
+   
     try:
         chat = client.chats.create(
             model="gemma-3-4b-it",
-            config={'max_output_tokens': token_limit}
+            config={'max_output_tokens': max_chars}
         )
-        constrained_prompt = f"You are an antminer expert reading the log of a asic antminer{prompt})"
+        constrained_prompt = f"You are an ASIC antminer expert, based on the miner give a prediction on how it would take the miner before it stop hashing{prompt})"
         res = chat.send_message(constrained_prompt)
         return  res.text
     except:
         return " model config failed"
 
-      
+
 def get_log(url):
     driver = webdriver.Chrome()
     last_log_content = ""
     try:
         driver.get(url)
-        wait = WebDriverWait(driver, 20)
+        wait = WebDriverWait(driver, 30)
+        try:
+            wait.until(EC.frame_to_be_available_and_switch_to_it((By.TAG_NAME, "iframe")))
+        except:
+            pass
         log_element = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "log-content")))
-        print("--- Started Real-Time Monitoring (Press Ctrl+C to stop) ---")
-
-        
         while True:
-            current_full_text = log_element.text
-            if current_full_text != last_log_content:
-                new_data = current_full_text[len(last_log_content):]
+            try:
+                raw_text = log_element.get_attribute("textContent") or ""
+                if len(raw_text) > len(last_log_content):
+                    new_raw_data = raw_text[len(last_log_content):]
+                    clean_new_data = " ".join([line.strip() for line in new_raw_data.splitlines() if line.strip()])
+                    
+                    if clean_new_data:
+                        with open("miner_log.txt", "a", encoding="utf-8") as f:
+                            f.write(clean_new_data + " ") 
+                        
+                        diagnoses = llm(prompt = clean_new_data[-20000:])
+                        print(diagnoses)
+                    
+                    last_log_content = raw_text
+                
+            except Exception:
+                log_element = driver.find_element(By.CLASS_NAME, "log-content")
+            
+            time.sleep(2)
 
-                if new_data:
-                    # print(new_data, end="") # Print new lines as they appear
-                    with open("miner_log.txt", "a", encoding="utf-8") as f:
-                        f.write(new_data)
-                last_log_content = current_full_text
-            time.sleep(2) 
-
-    except KeyboardInterrupt:
-        print("\nMonitoring stopped by user.")
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"Error: {e}")
     finally:
         driver.quit()
+
+url = "http://root:root@10.95.185.162/#blog"
+get_log(url)
