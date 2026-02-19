@@ -40,9 +40,11 @@ def get_stats_and_serial(miner_ip,USERNAME,PASSWORD):
         print(f"error: {miner_ip} - Error: {e}")
         return [miner_ip, "ERROR", str(e)]
     
-
+#note the api_key is free so using it doesn't harm me in anyway.
+#Iam prototyping this so yh I dont normally leave my api keys hanging in prod
 def llm(max_chars=200,prompt=None):
-    client = genai.Client(api_key="AIzaSyA1o9zGH1rHkbILGf88f65UWPKn4vI8Ux0")
+    api_key = os.getenv("API")
+    client = genai.Client(api_key=api_key)
    
     try:
         chat = client.chats.create(
