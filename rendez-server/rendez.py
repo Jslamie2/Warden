@@ -1,10 +1,12 @@
 import asyncio
-import websockets
 import json
-import time
-from typing import Dict, Optional, Set
-from dataclasses import dataclass, field
 import secrets
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Set
+
+import websockets
+
 
 @dataclass
 class Peer:
@@ -16,6 +18,7 @@ class Peer:
     last_seen: float = field(default_factory=time.time)
     room: Optional[str] = None
 
+
 class RendezvousServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 8765):
         self.host = host
@@ -24,7 +27,7 @@ class RendezvousServer:
         self.rooms: Dict[str, Set[str]] = {}
 
     async def start(self):
-        print(f"🚀 Rendezvous server starting on ws://{self.host}:{self.port}")
+        print(f"Rendezvous server starting on ws://{self.host}:{self.port}")
         asyncio.create_task(self.cleanup_loop())
         async with websockets.serve(self.handle_connection, self.host, self.port):
             await asyncio.Future()
@@ -45,20 +48,26 @@ class RendezvousServer:
             # --- HANDOVER LOGIC ---
             if peer_id in self.peers:
                 old_peer = self.peers[peer_id]
-                await self.send(websocket, {
-                    "type": "busy_notice",
-                    "message": "This ID is already active. Resume here to switch devices?"
-                })
+                await self.send(
+                    websocket,
+                    {
+                        "type": "busy_notice",
+                        "message": "This ID is already active. Resume here to switch devices?",
+                    },
+                )
 
                 try:
                     confirm_msg = await asyncio.wait_for(websocket.recv(), timeout=30.0)
                     confirm_data = json.loads(confirm_msg)
                     if confirm_data.get("action") == "resume":
-                        print(f"🔄 Handover: Kicking old {peer_id}")
-                        await self.send(old_peer.websocket, {
-                            "type": "suspended",
-                            "message": "Session moved to another device."
-                        })
+                        print(f"Handover: Kicking old {peer_id}")
+                        await self.send(
+                            old_peer.websocket,
+                            {
+                                "type": "suspended",
+                                "message": "Session moved to another device.",
+                            },
+                        )
                         await old_peer.websocket.close()
                     else:
                         await self.send_error(websocket, "Handover cancelled.")
@@ -73,17 +82,20 @@ class RendezvousServer:
                 websocket=websocket,
                 public_ip=remote_ip,
                 public_port=remote_port,
-                metadata=data.get("metadata", {})
+                metadata=data.get("metadata", {}),
             )
             self.peers[peer_id] = peer
-            print(f"✅ Peer registered: {peer_id} from {remote_ip}")
+            print(f"Peer registered: {peer_id} from {remote_ip}")
 
-            await self.send(websocket, {
-                "type": "registered",
-                "peer_id": peer_id,
-                "your_ip": remote_ip,
-                "your_port": remote_port
-            })
+            await self.send(
+                websocket,
+                {
+                    "type": "registered",
+                    "peer_id": peer_id,
+                    "your_ip": remote_ip,
+                    "your_port": remote_port,
+                },
+            )
 
             # 2. Main Message Loop
             async for message in websocket:
@@ -117,13 +129,11 @@ class RendezvousServer:
             print(f"Error handling message from {peer_id}: {e}")
 
     # ============ HANDLERS ============
-
     async def handle_list_peers(self, peer_id: str, data: dict):
         peer = self.peers.get(peer_id)
-        if not peer: return
-
+        if not peer:
+            return
         room_id = peer.room
-
         # LOGIC FIX: Determine who is in the "viewing range"
         if room_id and room_id in self.rooms:
             # Peer is in a room: target only people in that specific room
@@ -138,46 +148,45 @@ class RendezvousServer:
             if pid in target_ids and pid != peer_id
         ]
 
-        print(f"📋 {peer_id} requested list. Found {len(peers_info)} others in room '{room_id}'")
-        await self.send(peer.websocket, {
-            "type": "peer_list",
-            "peers": peers_info,
-            "room": room_id
-        })
+        print(
+            f"{peer_id} requested list. Found {len(peers_info)} others in room '{room_id}'"
+        )
+        await self.send(
+            peer.websocket, {"type": "peer_list", "peers": peers_info, "room": room_id}
+        )
 
     async def handle_join_room(self, peer_id: str, data: dict):
         room_id = data.get("room_id")
         peer = self.peers.get(peer_id)
-        if not peer: return
-
+        if not peer:
+            return
         # 1. Cleanup old room registry
         if peer.room and peer.room in self.rooms:
             self.rooms[peer.room].discard(peer_id)
             if not self.rooms[peer.room]:
                 del self.rooms[peer.room]
-
         # 2. Update peer state and new room registry
         peer.room = room_id
         if room_id:
             if room_id not in self.rooms:
                 self.rooms[room_id] = set()
             self.rooms[room_id].add(peer_id)
-            print(f"🏠 {peer_id} joined room: {room_id}")
+            print(f"{peer_id} joined room: {room_id}")
 
         await self.send(peer.websocket, {"type": "room_joined", "room_id": room_id})
 
     async def handle_signal(self, peer_id: str, data: dict):
         target_id = data.get("target_id")
         if target_id in self.peers:
-            await self.send(self.peers[target_id].websocket, {
-                "type": "signal",
-                "from": peer_id,
-                "data": data.get("data")
-            })
+            await self.send(
+                self.peers[target_id].websocket,
+                {"type": "signal", "from": peer_id, "data": data.get("data")},
+            )
 
     async def handle_broadcast(self, peer_id: str, data: dict):
         peer = self.peers.get(peer_id)
-        if not peer: return
+        if not peer:
+            return
         msg = {"type": "broadcast", "from": peer_id, "message": data.get("message")}
 
         if peer.room:
@@ -197,7 +206,7 @@ class RendezvousServer:
 
     async def broadcast_to_room(self, room_id: str, message: dict, exclude: str = None):
         if room_id in self.rooms:
-            for pid in list(self.rooms[room_id]): # use list() to avoid mutation errors
+            for pid in list(self.rooms[room_id]):  # use list() to avoid mutation errors
                 if pid != exclude and pid in self.peers:
                     await self.send(self.peers[pid].websocket, message)
 
@@ -207,11 +216,13 @@ class RendezvousServer:
             self.rooms[peer.room].discard(peer_id)
             if not self.rooms[peer.room]:
                 del self.rooms[peer.room]
-        print(f"🧹 Cleaned up: {peer_id}")
+        print(f"Cleaned up: {peer_id}")
 
     async def send(self, websocket, data: dict):
-        try: await websocket.send(json.dumps(data))
-        except: pass
+        try:
+            await websocket.send(json.dumps(data))
+        except:
+            pass
 
     async def send_error(self, websocket, message: str):
         await self.send(websocket, {"type": "error", "message": message})
@@ -226,6 +237,7 @@ class RendezvousServer:
             stale = [pid for pid, p in self.peers.items() if now - p.last_seen > 120]
             for pid in stale:
                 await self.cleanup_peer(pid)
+
 
 if __name__ == "__main__":
     server = RendezvousServer()
