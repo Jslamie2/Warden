@@ -4,7 +4,8 @@ import socket
 import subprocess
 import sys
 import time
-
+import signal
+import atexit
 
 def is_admin():
     try:
@@ -12,12 +13,8 @@ def is_admin():
     except:
         return False
 
-
 if not is_admin():
-    # Relaunch as Admin to allow 'netsh' and raw socket binding
-    ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, " ".join(sys.argv), None, 1
-    )
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
     sys.exit()
 
 try:
@@ -29,8 +26,30 @@ except ImportError:
 # --- CONFIGURATION ---
 TARGET_IP = "10.95.53.216"
 MASK = "255.255.255.0"
-PORTS = [7000, 4000, 53535, 6000]  # Scanning all common miner brands
+PORTS = [7000, 4000, 53535, 6000]
+ADAPTER_NAME = None # Will be set globally
 
+def cleanup():
+    """The 'Nuclear' Cleanup: Force adapter back to DHCP"""
+    if ADAPTER_NAME:
+        print(f"\n[CLEANUP] Resetting {ADAPTER_NAME} to DHCP...")
+        # Delete specific address
+        subprocess.run(f'netsh interface ipv4 delete address "{ADAPTER_NAME}" {TARGET_IP}', shell=True, capture_output=True)
+        # Force DHCP just in case
+        subprocess.run(f'netsh interface ip set address "{ADAPTER_NAME}" dhcp', shell=True, capture_output=True)
+        # Refresh connection
+        subprocess.run('ipconfig /renew', shell=True, capture_output=True)
+        print("[CLEANUP] Internet restored.")
+
+# Register cleanup to run even on crashes or sys.exit()
+atexit.register(cleanup)
+
+def signal_handler(sig, frame):
+    sys.exit(0)
+
+# Catch Ctrl+C and other terminations
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 def find_adapter():
     for adapter, addrs in psutil.net_if_addrs().items():
@@ -39,26 +58,20 @@ def find_adapter():
                 return adapter
     return None
 
-
 def main():
-    name = find_adapter()
-    if not name:
-        print("❌ ERROR: No active adapter found on 10.95.x.x network.")
-        print("Check your Ethernet cable and ensure your PC has a 10.95 IP.")
-        input("Press Enter to exit...")
+    global ADAPTER_NAME
+    ADAPTER_NAME = find_adapter()
+    
+    if not ADAPTER_NAME:
+        print("ERROR: No active adapter found on 10.95.x.x network.")
         return
 
-    print(f"Found Adapter: {name}")
+    print(f"Found Adapter: {ADAPTER_NAME}")
     print(f"Injecting Subnet Alias {TARGET_IP}...")
 
-    subprocess.run(
-        f'netsh interface ipv4 add address "{name}" {TARGET_IP} {MASK}',
-        shell=True,
-        capture_output=True,
-    )
+    subprocess.run(f'netsh interface ipv4 add address "{ADAPTER_NAME}" {TARGET_IP} {MASK}', shell=True)
 
     sockets = []
-    print("\nINITIALIZING LISTENERS:")
     for p in PORTS:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -69,51 +82,21 @@ def main():
             sockets.append((s, p))
             print(f"  [OPEN] Port {p}")
         except OSError:
-            # This prevents the WinError 10013 from crashing the script
-            print(f"  [SKIP] Port {p} - Blocked by Firewall or another App")
+            print(f"  [SKIP] Port {p} - Blocked")
 
-    if not sockets:
-        print(
-            "\n❌ CRITICAL: All ports blocked. Disable Windows Firewall/Antivirus and retry."
-        )
-        input("Press Enter to exit...")
-        return
-
-    print("\n" + "=" * 50)
-    print(" SCANNER ACTIVE - I AM LISTENING...")
-    print("STAND AT THE MINER.")
-    print(" PRESS AND HOLD THE 'IP REPORT' BUTTON FOR 10 SECONDS.")
-    print("=" * 50)
-    print("(Press Ctrl+C to stop and clean up)")
+    print("\nSCANNER ACTIVE - Press Ctrl+C to stop and restore internet.")
 
     try:
         while True:
             for sock, port in sockets:
                 try:
                     data, addr = sock.recvfrom(1024)
-                    print("\n" + "*" * 20)
-                    print(f"MINER DETECTED!")
-                    print(f"IP ADDRESS : {addr[0]}")
-                    print(f"REPORT PORT: {port}")
-                    print(f"RAW DATA   : {data.hex()}")
-                    print("*" * 20)
+                    print(f"\nMINER DETECTED! IP: {addr[0]}")
                 except BlockingIOError:
                     continue
-            time.sleep(0.1)  # Prevent 100% CPU usage
-    except KeyboardInterrupt:
-        print("\nStopping...")
-    finally:
-        print(f"\nCLEANING UP: Removing {TARGET_IP}...")
-        subprocess.run(
-            f'netsh interface ipv4 delete address "{name}" {TARGET_IP}',
-            shell=True,
-            capture_output=True,
-        )
-        for sock, port in sockets:
-            sock.close()
-        print("Done.")
-        input("Press Enter to close.")
-
+            time.sleep(0.1)
+    except SystemExit:
+        pass # atexit handles this
 
 if __name__ == "__main__":
     main()
