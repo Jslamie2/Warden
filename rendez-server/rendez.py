@@ -102,7 +102,7 @@ class RendezvousServer:
                 await self.handle_message(peer_id, message)
 
         except websockets.exceptions.ConnectionClosed:
-            print(f"🔌 Connection closed: {peer_id}")
+            print(f"Connection closed: {peer_id}")
         except Exception as e:
             print(f"❌ Error with peer {peer_id}: {e}")
         finally:
@@ -141,6 +141,8 @@ class RendezvousServer:
         else:
             # Peer is not in a room: target everyone who is ALSO not in a room
             target_ids = [pid for pid, p in self.peers.items() if p.room is None]
+
+        print(self.peers.items())
 
         peers_info = [
             {"peer_id": pid, "metadata": p.metadata}
@@ -188,7 +190,6 @@ class RendezvousServer:
         if not peer:
             return
         msg = {"type": "broadcast", "from": peer_id, "message": data.get("message")}
-
         if peer.room:
             await self.broadcast_to_room(peer.room, msg, exclude=peer_id)
         else:
@@ -203,7 +204,6 @@ class RendezvousServer:
             await self.send(self.peers[peer_id].websocket, {"type": "pong"})
 
     # ============ UTILITIES ============
-
     async def broadcast_to_room(self, room_id: str, message: dict, exclude: str = None):
         if room_id in self.rooms:
             for pid in list(self.rooms[room_id]):  # use list() to avoid mutation errors
