@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox, simpledialog
 import threading
 import socket
 import struct
@@ -9,6 +9,10 @@ import webbrowser
 from datetime import datetime
 import queue
 import sys
+import json
+import asyncio
+import websockets
+from database import init_db, get_or_create_user, report_miner, mark_visited, get_collisions, insert_broadcast, get_roster, get_unvisited_miners, get_miner_reporters, get_user_display_name
 
 # Import the listener functions from ip_listener
 sys.path.insert(0, '.')
@@ -48,15 +52,33 @@ except ImportError:
 class MinerIPReporterGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Warden - IP Reporter")
-        self.root.geometry("900x700")
+        self.root.title("Warden - IP Reporter (Network-Aware)")
+        self.root.geometry("1100x800")
         self.root.configure(bg="#1a1a2e")
         
+        # Initialize DB
+        init_db()
+        
+        # Get/create user
+        self.hostname = socket.gethostname()
+        self.user = get_or_create_user()
+        self.user_id = self.user['id']
+        self.display_name = self.user.get('display_name', self.hostname)
+        self.user_id = self.user['id']
+        self.hostname = socket.gethostname()
+        self.display_name = self.user.get('display_name', self.hostname)
+        self.local_ip = get_preferred_local_ip()
+        self.subnet_prefix = get_subnet_prefix(self.local_ip)
+        print(f"Initialized: User ID {self.user_id} ({self.hostname}), Subnet {self.subnet_prefix}")
+        
         # Data structures
-        self.miner_entries = {}  # MAC -> {ip, time, visited, widget}
+        self.miner_entries = {}  # temp UI cache
         self.listening = False
+        self.ws_connected = False
         self.listener_thread = None
+        self.ws_thread = None
         self.packet_queue = queue.Queue()
+        self.roster_data = {}  # network roster cache
         
         # Colors
         self.bg_dark = "#16213e"
@@ -65,9 +87,101 @@ class MinerIPReporterGUI:
         self.text_white = "#ffffff"
         self.text_gray = "#a0a0a0"
         self.visited_color = "#4ecca3"
+        self.conflict_color = "#ffaa00"
+        
+        # WS config
+        self.ws_uri = "ws://localhost:8765"
+        self.peer_id = f"{self.user_id}-{self.hostname[:8]}"
+        self.room_id = self.subnet_prefix
+        
+        # Start WS thread (async event loop in thread)
+        self.ws_thread = threading.Thread(target=self.ws_client_loop, daemon=True)
+        self.ws_thread.start()
         
         self.setup_ui()
         self.process_queue()
+        self.update_local_ip()
+    
+    def ws_client_loop(self):
+        """Async WS client loop in thread."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self.ws_async_client())
+    
+    async def ws_async_client(self):
+        """Async WS connection/reconnect."""
+        while True:
+            try:
+                async with websockets.connect(self.ws_uri) as ws:
+                    self.ws_connected = True
+                    print(f"WS connected as {self.peer_id} in room {self.room_id}")
+                    
+                    # Register
+                    await ws.send(json.dumps({
+                        "action": "register",
+                        "peer_id": self.peer_id,
+                        "metadata": {
+                            "user_id": self.user_id,
+                            "hostname": self.hostname,
+                            "subnet": self.subnet_prefix,
+                            "type": "warden_gui"
+                        }
+                    }))
+                    
+                    # Join room
+                    await ws.send(json.dumps({
+                        "action": "join_room",
+                        "room_id": self.room_id
+                    }))
+                    
+                    # List peers / roster
+                    await ws.send(json.dumps({"action": "list_peers"}))
+                    
+                    async for message in ws:
+                        data = json.loads(message)
+                        self.handle_ws_message(data)
+                        
+            except Exception as e:
+                self.ws_connected = False
+                print(f"WS disconnect: {e}")
+                await asyncio.sleep(5)
+    
+    def handle_ws_message(self, data):
+        """Handle incoming WS messages."""
+        msg_type = data.get('type')
+        if msg_type == 'registered':
+            print(f"WS registered: {data}")
+        elif msg_type == 'peer_list':
+            self.roster_data = data
+            # Update roster UI
+            self.root.after(0, self.update_roster_ui)
+        elif msg_type == 'broadcast':
+            self.root.after(0, lambda: self.handle_broadcast(data))
+    
+    def handle_broadcast(self, data):
+        """Handle broadcast msg (collision, url_available)."""
+        msg = data['message']
+        msg_type = msg.get('type')
+        if msg_type == 'ip_assigned':
+            mac = msg['mac']
+            other_user = msg['computer_name']
+            messagebox.showinfo("Network Assignment", f"{other_user} assigned miner {mac}")
+        elif msg_type == 'collision_alert':
+            messagebox.showwarning("Collision!", msg['alert'])
+    
+    def update_roster_ui(self):
+        """Update network roster display."""
+        from database import get_all_users
+        self.roster_text.delete(1.0, tk.END)
+        users = get_all_users()
+        roster_text = "Network Users:\n\n"
+        for user in users:
+            display = user.get('display_name', user['computer_name'])
+            roster_text += f"{display} (@{user['computer_name']}) ID:{user['id']}\n"
+        self.roster_text.insert(1.0, roster_text)
+        
+        # Trigger periodic update
+        self.root.after(10000, self.update_roster_ui)
     
     def setup_ui(self):
         # Header
@@ -85,9 +199,15 @@ class MinerIPReporterGUI:
         )
         title_label.pack(side="left", pady=10)
         
-        # Status indicator
+        # User/Status
+        status_frame = tk.Frame(header_frame, bg=self.bg_dark)
+        status_frame.pack(side="right", pady=10)
+        
+        self.ws_status = tk.Label(status_frame, text="WS: OFFLINE", fg="#ff6b6b", font=("Segoe UI", 10))
+        self.ws_status.pack(side="right", padx=10)
+        
         self.status_label = tk.Label(
-            header_frame,
+            status_frame,
             text="STOPPED",
             font=("Segoe UI", 12),
             bg=self.bg_dark,
@@ -95,15 +215,27 @@ class MinerIPReporterGUI:
             padx=15,
             pady=5
         )
-        self.status_label.pack(side="right", pady=10)
+        self.status_label.pack(side="right")
         
         # Info Bar
         info_frame = tk.Frame(self.root, bg=self.bg_card, padx=20, pady=15)
         info_frame.pack(fill="x", padx=20, pady=(0, 10))
         
+        self.name_btn = tk.Button(
+            info_frame,
+            text=f"Name: {self.display_name}",
+            font=("Segoe UI", 11, "bold"),
+            bg=self.bg_card,
+            fg=self.accent,
+            cursor="hand2",
+            command=self.update_name,
+            padx=10
+        )
+        self.name_btn.pack(side="left", padx=(0,10))
+        
         self.local_ip_label = tk.Label(
             info_frame,
-            text="Local IP: Detecting...",
+            text=f"Local: {self.local_ip} | Subnet: {self.subnet_prefix} | ID:{self.user_id}",
             font=("Segoe UI", 11),
             bg=self.bg_card,
             fg=self.text_white
@@ -112,12 +244,41 @@ class MinerIPReporterGUI:
         
         self.ports_label = tk.Label(
             info_frame,
-            text="Ports: 14235, 12207",
+            text="Ports: 14235/12207 | WS:8765",
             font=("Segoe UI", 11),
             bg=self.bg_card,
             fg=self.text_gray
         )
         self.ports_label.pack(side="right")
+        
+        # Notebook for tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=20, pady=10)
+        
+        # Miners tab
+        miners_frame = tk.Frame(self.notebook, bg=self.bg_dark)
+        self.notebook.add(miners_frame, text="Miners")
+        
+        list_container = tk.Frame(miners_frame, bg=self.bg_dark, padx=20, pady=10)
+        list_container.pack(fill="both", expand=True)
+        
+        scrollbar = tk.Scrollbar(list_container)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.miner_list = tk.Canvas(list_container, bg=self.bg_dark, highlightthickness=0, yscrollcommand=scrollbar.set)
+        self.miner_list.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.miner_list.yview)
+        
+        self.miner_list_frame = tk.Frame(self.miner_list, bg=self.bg_dark)
+        self.miner_list.create_window((0, 0), window=self.miner_list_frame, anchor="nw")
+        self.miner_list_frame.bind("<Configure>", lambda e: self.miner_list.configure(scrollregion=self.miner_list.bbox("all")))
+        
+        # Roster tab
+        roster_frame = tk.Frame(self.notebook, bg=self.bg_dark)
+        self.notebook.add(roster_frame, text="Network Roster")
+        
+        self.roster_text = scrolledtext.ScrolledText(roster_frame, bg=self.bg_card, fg=self.text_white, font=("Consolas", 10))
+        self.roster_text.pack(fill="both", expand=True, padx=20, pady=20)
         
         # Buttons Frame
         btn_frame = tk.Frame(self.root, bg=self.bg_dark, padx=20, pady=10)
@@ -130,7 +291,6 @@ class MinerIPReporterGUI:
             bg=self.accent,
             fg=self.text_white,
             activebackground="#ff6b9d",
-            activeforeground=self.text_white,
             padx=25,
             pady=10,
             borderwidth=0,
@@ -146,7 +306,6 @@ class MinerIPReporterGUI:
             bg="#4a4a6a",
             fg=self.text_white,
             activebackground="#6a6a8a",
-            activeforeground=self.text_white,
             padx=25,
             pady=10,
             borderwidth=0,
@@ -156,76 +315,61 @@ class MinerIPReporterGUI:
         )
         self.stop_btn.pack(side="left", padx=5)
         
-        # Stats
         self.stats_label = tk.Label(
             btn_frame,
-            text="Miners Found: 0 | Unvisited: 0",
+            text="Miners: 0 | Unvisited: 0 | Peers: 0",
             font=("Segoe UI", 11),
             bg=self.bg_dark,
             fg=self.text_gray,
             padx=20
         )
         self.stats_label.pack(side="right", padx=10)
-        
-        # Miner List (scrollable frame)
-        list_container = tk.Frame(self.root, bg=self.bg_dark, padx=20, pady=10)
-        list_container.pack(fill="both", expand=True)
-        
-        # Scrollbar
-        scrollbar = tk.Scrollbar(list_container)
-        scrollbar.pack(side="right", fill="y")
-        
-        self.miner_list = tk.Canvas(
-            list_container,
-            bg=self.bg_dark,
-            highlightthickness=0,
-            yscrollcommand=scrollbar.set
-        )
-        self.miner_list.pack(side="left", fill="both", expand=True)
-        scrollbar.config(command=self.miner_list.yview)
-        
-        self.miner_list_frame = tk.Frame(self.miner_list, bg=self.bg_dark)
-        self.miner_list.create_window((0, 0), window=self.miner_list_frame, anchor="nw")
-        
-        self.miner_list_frame.bind("<Configure>", lambda e: self.miner_list.configure(scrollregion=self.miner_list.bbox("all")))
-        
-        # Footer
-        footer = tk.Label(
-            self.root,
-            text="Waiting for miners to press IP Report button...",
-            font=("Segoe UI", 10),
-            bg=self.bg_dark,
-            fg=self.text_gray,
-            pady=10
-        )
-        footer.pack(fill="x")
-        
-        # Update local IP display
-        self.update_local_ip()
+    
+    def update_ws_status(self):
+        """Update WS status label."""
+        if self.ws_connected:
+            self.ws_status.config(text="WS: ONLINE", fg="#4ecca3")
+        else:
+            self.ws_status.config(text="WS: OFFLINE", fg="#ff6b6b")
+    
+    def update_name(self):
+        """Update display name."""
+        new_name = tk.simpledialog.askstring("Update Name", "Enter new display name:", initialvalue=self.display_name)
+        if new_name and new_name.strip():
+            new_name = new_name.strip()
+            self.user = get_or_create_user(display_name=new_name)
+            self.display_name = new_name
+            self.name_btn.config(text=f"Name: {self.display_name}")
+            self.local_ip_label.config(text=f"Local: {self.local_ip} | Subnet: {self.subnet_prefix} | ID:{self.user_id}")
+            print(f"Name updated to: {self.display_name}")
     
     def update_local_ip(self):
+        """Update local IP display."""
         local_ips = get_local_ips()
         local_ip = get_preferred_local_ip()
-        self.local_ip_label.config(text="Local IP: " + local_ip)
+        self.local_ip_label.config(text=f"Local: {local_ip} | Subnet: {self.subnet_prefix} | ID:{self.user_id}")
         if len(local_ips) > 1:
-            self.local_ip_label.config(text="Local IP: " + local_ip + " (" + str(len(local_ips)) + " interfaces)")
+            self.local_ip_label.config(text=f"Local: {local_ip} ({len(local_ips)} ifaces) | Subnet: {self.subnet_prefix} | ID:{self.user_id}")
     
     def start_listening(self):
+        """Start UDP listening."""
         self.listening = True
-        self.start_btn.config(bg="#4a4a6a", state="disabled")
-        self.stop_btn.config(bg=self.accent, state="normal")
+        self.start_btn.config(state="disabled", bg="#4a4a6a")
+        self.stop_btn.config(state="normal", bg=self.accent)
         self.status_label.config(text="LISTENING", fg="#4ecca3")
         
         self.listener_thread = threading.Thread(target=self.listen_for_miners, daemon=True)
         self.listener_thread.start()
     
     def stop_listening(self):
+        """Stop UDP listening."""
         self.listening = False
-        self.start_btn.config(bg=self.accent, state="normal")
-        self.stop_btn.config(bg="#4a4a6a", state="disabled")
+        self.start_btn.config(state="normal", bg=self.accent)
+        self.stop_btn.config(state="disabled", bg="#4a4a6a")
         self.status_label.config(text="STOPPED", fg="#ff6b6b")
     
     def listen_for_miners(self):
+        """UDP listener for miner broadcasts."""
         port = 14235
         local_ips = get_local_ips()
         
@@ -243,7 +387,6 @@ class MinerIPReporterGUI:
             except:
                 pass
         
-        # Also listen on secondary port
         sock2 = None
         try:
             sock2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -257,85 +400,92 @@ class MinerIPReporterGUI:
         while self.listening:
             try:
                 sock.settimeout(1.0)
-                try:
-                    data, addr = sock.recvfrom(1024)
-                    if len(data) >= 11:
-                        try:
-                            _, mac_raw, ip_raw = struct.unpack('>B6s4s', data[:11])
-                            mac_str = ':'.join(f'{b:02x}' for b in mac_raw)
-                            ip_str = socket.inet_ntoa(ip_raw)
-                            
-                            if not ip_str or ip_str.startswith('0.') or ip_str.startswith('127.') or ip_str.startswith('255.'):
-                                ip_str = addr[0]
-                            
-                            if not is_valid_local_ip(ip_str):
-                                if len(data) >= 18:
-                                    try:
-                                        _, mac_raw, _, ip_raw = struct.unpack('>B6sB4s', data[:12])
-                                        ip_str = socket.inet_ntoa(ip_raw)
-                                    except: pass
-                            
-                            if not is_valid_local_ip(ip_str):
-                                ip_str = addr[0]
-                            
-                            # Add to queue for GUI update
-                            self.packet_queue.put({
-                                'ip': ip_str,
-                                'mac': mac_str,
-                                'origin': addr[0],
-                                'time': datetime.now().strftime("%H:%M:%S")
-                            })
-                        except Exception as e:
-                            print(f"Parse error: {e}")
-                except socket.timeout:
-                    pass
+                data, addr = sock.recvfrom(1024)
+                if len(data) >= 11:
+                    _, mac_raw, ip_raw = struct.unpack('>B6s4s', data[:11])
+                    mac = ':'.join(f'{b:02x}' for b in mac_raw)
+                    ip = socket.inet_ntoa(ip_raw)
+                    
+                    if not is_valid_local_ip(ip):
+                        ip = addr[0]
+                    
+                    self.root.after(0, lambda m=mac, i=ip: self.add_miner_entry(i, m, addr[0], datetime.now().strftime("%H:%M:%S")))
+            except socket.timeout:
+                pass
             except Exception as e:
-                if self.listening:
-                    print(f"Listen error: {e}")
+                print(f"Listen error: {e}")
         
         sock.close()
         if sock2:
             sock2.close()
     
     def process_queue(self):
-        try:
-            while True:
-                data = self.packet_queue.get_nowait()
-                self.add_miner_entry(data['ip'], data['mac'], data['origin'], data['time'])
-        except queue.Empty:
-            pass
-        
+        """Process UDP packets."""
         self.root.after(100, self.process_queue)
     
     def add_miner_entry(self, ip, mac, origin, time_str):
-        # Check if MAC already exists
-        if mac in self.miner_entries:
-            # Update existing entry
-            entry = self.miner_entries[mac]
-            entry['ip'] = ip
-            entry['time'] = time_str
-            entry['time_label'].config(text="Time: " + time_str)
-            entry['ip_label'].config(text="IP: " + ip)
-            # Move to top
-            entry['frame'].lift()
-        else:
-            # Create new entry
+        """Add miner to UI, check collision, report to DB/WS."""
+        # Collision check
+        collisions = get_collisions(mac, self.user_id)
+        if collisions:
+            alert = f"Collision! {len(collisions)} other users reported {mac}:"
+            for c in collisions[:3]:
+                alert += f"\n  - {c['computer_name']} ({c['reported_ip']})"
+            messagebox.showwarning("Miner Collision Detected", alert)
+            # Broadcast collision
+            insert_broadcast("collision_alert", self.user_id, {"mac": mac, "alert": alert})
+        
+        # Report to DB
+        report_miner(mac, ip, self.user_id)
+        
+        # Broadcast IP assigned
+        insert_broadcast("ip_assigned", self.user_id, {
+            "computer_name": self.hostname,
+            "mac": mac,
+            "ip": ip
+        })
+        
+        # Create UI card
+        if mac not in self.miner_entries:
             self.create_miner_card(mac, ip, time_str)
         
         self.update_stats()
     
     def create_miner_card(self, mac, ip, time_str):
+        """Create miner card in UI."""
         card = tk.Frame(self.miner_list_frame, bg=self.bg_card, padx=15, pady=12)
         card.pack(fill="x", pady=5)
         
-        # Left side - Info
         info_frame = tk.Frame(card, bg=self.bg_card)
         info_frame.pack(side="left", fill="x", expand=True)
         
-        # IP (clickable)
+# Get reporter info
+        from database import get_connection, get_miner_reporters
+        # Need miner_id - query miners table by mac
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT id FROM miners WHERE mac_address = ?', (mac,))
+        miner_row = cursor.fetchone()
+        conn.close()
+        if miner_row:
+            miner_id = miner_row['id']
+            reporters = get_miner_reporters(miner_id)
+            reporter_info = reporters[0] if reporters else None
+            if reporter_info:
+                reporter_name = reporter_info['display_name']
+                user_computer = reporter_info.get('computer_name', 'Unknown')
+            else:
+                reporter_name = 'Unknown'
+                user_computer = 'Unknown'
+            if len(reporters) > 1:
+                reporter_name = 'Multi'
+                user_computer = 'Multi'
+        else:
+            reporter_name = 'Unknown'
+        
         ip_label = tk.Label(
             info_frame,
-            text="IP: " + ip,
+            text=f"[{reporter_name} ({user_computer})] {ip}",
             font=("Segoe UI", 14, "bold"),
             bg=self.bg_card,
             fg="#00d9ff",
@@ -344,27 +494,24 @@ class MinerIPReporterGUI:
         ip_label.pack(anchor="w")
         ip_label.bind("<Button-1>", lambda e: self.open_browser(ip, mac))
         
-        # MAC
         mac_label = tk.Label(
             info_frame,
-            text="MAC: " + mac,
+            text=f"MAC: {mac}",
             font=("Segoe UI", 10),
             bg=self.bg_card,
             fg=self.text_gray
         )
         mac_label.pack(anchor="w")
         
-        # Time
         time_label = tk.Label(
             info_frame,
-            text="Time: " + time_str,
+            text=f"Time: {time_str}",
             font=("Segoe UI", 10),
             bg=self.bg_card,
             fg=self.text_gray
         )
         time_label.pack(anchor="w")
         
-        # Right side - Visit button / Status
         status_frame = tk.Frame(card, bg=self.bg_card)
         status_frame.pack(side="right", padx=10)
         
@@ -383,10 +530,10 @@ class MinerIPReporterGUI:
         )
         visit_btn.pack()
         
-        # Store entry data
         self.miner_entries[mac] = {
             'ip': ip,
             'mac': mac,
+            'reporter_name': reporter_name,
             'visited': False,
             'frame': card,
             'ip_label': ip_label,
@@ -395,48 +542,51 @@ class MinerIPReporterGUI:
         }
     
     def open_browser(self, ip, mac):
+        """Open miner IP, mark visited, broadcast."""
         if mac in self.miner_entries:
             entry = self.miner_entries[mac]
+            reporter_name = entry.get('reporter_name', 'Unknown')
             entry['visited'] = True
-            
-            # Update UI to show visited
             entry['ip_label'].config(fg=self.visited_color)
             entry['visit_btn'].config(text="VISITED", bg=self.visited_color)
             
-            # Open browser
-            url = "http://" + ip
-            webbrowser.open(url)
+            # Mark in DB
+            # Get actual miner_id
+            from database import get_connection
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT id FROM miners WHERE mac_address = ?', (mac,))
+            miner_row = cursor.fetchone()
+            conn.close()
+            if miner_row:
+                mark_visited(miner_row['id'], self.user_id)
             
-            self.update_stats()
+            print(f"Visiting {reporter_name}'s miner {mac} at {ip}")
+            
+            # Broadcast url available
+            insert_broadcast("url_available", self.user_id, {
+                "display_name": self.display_name,
+                "mac": mac,
+                "ip": ip
+            })
+            
+            webbrowser.open(f"http://{ip}")
+        
+        self.update_stats()
     
     def update_stats(self):
+        """Update stats label."""
         total = len(self.miner_entries)
-        unvisited = sum(1 for e in self.miner_entries.values() if not e['visited'])
+        unvisited = len([e for e in self.miner_entries.values() if not e['visited']])
+        peers = len(self.roster_data.get('peers', [])) if self.roster_data else 0
         
-        # Update footer message
-        if unvisited > 0:
-            msg = str(unvisited) + " miner(s) not visited - Click the IP to open browser or click VISIT"
-        else:
-            msg = "All miners have been visited"
-        
-        # Find and update footer (last widget)
-        for widget in self.root.winfo_children():
-            if isinstance(widget, tk.Label):
-                try:
-                    text = widget.cget("text")
-                    if text.startswith("Waiting") or "not visited" in text or "visited" in text:
-                        widget.config(text=msg)
-                        break
-                except:
-                    pass
-        
-        self.stats_label.config(text="Miners Found: " + str(total) + " | Unvisited: " + str(unvisited))
+        self.stats_label.config(text=f"Miners: {total} | Unvisited: {unvisited} | Peers: {peers}")
 
 
 def main():
     root = tk.Tk()
     
-    # Set window icon (if available)
+    # Set window icon
     try:
         root.iconbitmap("miner.ico")
     except:
@@ -448,4 +598,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

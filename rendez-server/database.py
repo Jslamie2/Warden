@@ -2,6 +2,7 @@ import sqlite3
 import os
 import socket
 import getpass
+import json
 from datetime import datetime
 
 DB_PATH = os.path.join(os.path.dirname(__file__), 'warden.db')
@@ -63,7 +64,43 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     ''')
-    
+
+    # BroadcastMessages table - for WS network broadcasts
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS broadcast_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,  -- 'ip_assigned', 'url_available', 'collision_alert'
+            sender_user_id INTEGER,
+            data TEXT NOT NULL,  -- JSON string
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (sender_user_id) REFERENCES users(id)
+        )
+    ''')
+
+    # AntminerAssignments table - track assignments and status
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS antminer_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            miner_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            status TEXT DEFAULT 'assigned',  -- assigned, pending, visited, conflicted
+            context TEXT,
+            assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (miner_id) REFERENCES miners(id),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ''')
+
+    # NetworkSessions table - active multi-user sessions per subnet
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS network_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subnet_prefix TEXT UNIQUE NOT NULL,
+            active_users TEXT DEFAULT '[]',  -- JSON list of user_ids
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -303,6 +340,85 @@ def delete_miner(miner_id):
     
     conn.commit()
     conn.close()
+
+def insert_broadcast(message_type, sender_user_id, data_dict):
+    """Insert a broadcast message into DB."""
+    data_json = json.dumps(data_dict)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT INTO broadcast_messages (type, sender_user_id, data) VALUES (?, ?, ?)',
+        (message_type, sender_user_id, data_json)
+    )
+    conn.commit()
+    conn.close()
+
+def get_collisions(mac_address, exclude_user_id=None):
+    """Get conflicting reports for same MAC by other users (unvisited)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    query = '''
+        SELECT DISTINCT r.*, m.ip_address, m.mac_address, u.computer_name, u.username
+        FROM reports r
+        JOIN miners m ON r.miner_id = m.id
+        JOIN users u ON r.user_id = u.id
+        LEFT JOIN visits v ON v.miner_id = m.id AND v.user_id = r.user_id
+        WHERE m.mac_address = ? AND v.id IS NULL
+    '''
+    params = [mac_address]
+    if exclude_user_id:
+        query += ' AND r.user_id != ?'
+        params.append(exclude_user_id)
+    query += ' ORDER BY r.reported_at DESC'
+    cursor.execute(query, params)
+    collisions = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return collisions
+
+def get_roster(subnet_prefix):
+    """Get active roster for subnet: users + their assignments."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    # Get session
+    cursor.execute('SELECT * FROM network_sessions WHERE subnet_prefix = ?', (subnet_prefix,))
+    session = cursor.fetchone()
+    # Get recent active users/assignments
+    cursor.execute('''
+        SELECT DISTINCT u.*, a.status, m.mac_address, m.ip_address
+        FROM users u
+        LEFT JOIN antminer_assignments a ON a.user_id = u.id
+        LEFT JOIN miners m ON a.miner_id = m.id
+        WHERE u.created_at > datetime('now', '-1 hour')
+        ORDER BY u.created_at DESC
+    ''')
+    roster = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return {'session': dict(session) if session else None, 'roster': roster}
+
+def get_miner_reporters(miner_id):
+    """Get all unique reporters for a miner with display names."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT DISTINCT u.id as user_id, 
+               COALESCE(u.display_name, u.computer_name, u.username) as display_name,
+               r.reported_ip,
+               r.reported_at
+        FROM reports r
+        JOIN users u ON r.user_id = u.id
+        WHERE r.miner_id = ?
+        ORDER BY r.reported_at DESC
+    ''', (miner_id,))
+    reporters = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return reporters
+
+
+def get_user_display_name(user_id):
+    """Get display name for user, fallback to computer_name/username."""
+    user = get_user_by_id(user_id)
+    return user['display_name'] or user['computer_name'] or user['username'] or 'Unknown' if user else 'Unknown'
+
 
 def get_user_visited_miners_with_info(user_id):
     """Get all miners visited by a user with visit info."""
