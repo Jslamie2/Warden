@@ -343,6 +343,16 @@ class MinerIPReporterGUI:
             self.local_ip_label.config(text=f"Local: {self.local_ip} | Subnet: {self.subnet_prefix} | ID:{self.user_id}")
             print(f"Name updated to: {self.display_name}")
     
+    def update_miner_stats(self, mac, total_hashrate, avg_hashrate):
+        """Update hashrate statistics for a given miner card."""
+        if mac in self.miner_entries:
+            entry = self.miner_entries[mac]
+            stats_text = f"Total: {total_hashrate:.2f} TH/s | Avg: {avg_hashrate:.2f} TH/s"
+            entry['stats_label'].config(text=stats_text)
+
+
+
+    
     def update_local_ip(self):
         """Update local IP display."""
         local_ips = get_local_ips()
@@ -594,7 +604,6 @@ def main():
     
     app = MinerIPReporterGUI(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
