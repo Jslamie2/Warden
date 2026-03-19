@@ -48,6 +48,26 @@ except ImportError:
     
     def add_firewall_rule(port): pass
 
+def get_miner_stats(ip, port=4028):
+    command = {"command": "stats"}
+    
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5) # 5 second timeout
+        sock.connect((ip, port))
+        sock.sendall(json.dumps(command).encode('utf-8'))
+        response = b""
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            response += data
+            
+        sock.close()
+        return json.loads(response.decode('utf-8').replace('\x00', ''))
+    except Exception as e:
+        return {"error": f"Could not connect to {ip}: {e}"}
+
 
 class MinerIPReporterGUI:
     def __init__(self, root):
@@ -259,19 +279,30 @@ class MinerIPReporterGUI:
         miners_frame = tk.Frame(self.notebook, bg=self.bg_dark)
         self.notebook.add(miners_frame, text="Miners")
         
-        list_container = tk.Frame(miners_frame, bg=self.bg_dark, padx=20, pady=10)
-        list_container.pack(fill="both", expand=True)
+        self.miners_frame_container = tk.Frame(miners_frame, bg=self.bg_dark, padx=20, pady=10)
+        self.miners_frame_container.pack(fill="both", expand=True)
+
+        # Create a canvas for scrolling
+        self.canvas = tk.Canvas(self.miners_frame_container, bg=self.bg_dark, bd=0, highlightthickness=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        # Add a scrollbar to the canvas
+        self.scrollbar = ttk.Scrollbar(self.miners_frame_container, orient="vertical", command=self.canvas.yview)
+        self.scrollbar.pack(side="right", fill="y")
+
+        # Configure the canvas
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
         
-        scrollbar = tk.Scrollbar(list_container)
-        scrollbar.pack(side="right", fill="y")
+        # Create an inner frame inside the canvas to hold the miner cards
+        self.scrollable_frame = tk.Frame(self.canvas, bg=self.bg_dark)
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         
-        self.miner_list = tk.Canvas(list_container, bg=self.bg_dark, highlightthickness=0, yscrollcommand=scrollbar.set)
-        self.miner_list.pack(side="left", fill="both", expand=True)
-        scrollbar.config(command=self.miner_list.yview)
-        
-        self.miner_list_frame = tk.Frame(self.miner_list, bg=self.bg_dark)
-        self.miner_list.create_window((0, 0), window=self.miner_list_frame, anchor="nw")
-        self.miner_list_frame.bind("<Configure>", lambda e: self.miner_list.configure(scrollregion=self.miner_list.bbox("all")))
+        # Bind an event to resize the inner frame when the canvas width changes
+        self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind('<Configure>', self._on_canvas_resize)
+
+        # Bind mouse wheel scrolling
+        self.canvas.bind_all("<MouseWheel>", self._on_mouse_wheel)
         
         # Roster tab
         roster_frame = tk.Frame(self.notebook, bg=self.bg_dark)
@@ -350,6 +381,25 @@ class MinerIPReporterGUI:
             del self.miner_entries[mac]
             self.update_stats()
             messagebox.showinfo("Deleted", f"Miner {mac} and its reports have been deleted.")
+
+    def _fetch_and_update_miner_stats(self, mac, ip):
+        stats = get_miner_stats(ip)
+        self.root.after(0, lambda: self.update_miner_card_stats(mac, stats))
+
+    def update_miner_card_stats(self, mac, stats):
+        if mac in self.miner_entries:
+            entry = self.miner_entries[mac]
+            if "error" in stats:
+                entry['stats_label'].config(text=f"Error: {stats['error']}", fg="red")
+            elif stats and 'STATS' in stats and stats['STATS']:
+                miner_stats = stats['STATS'][0] # Assuming first STATS entry is primary
+                hashrate = miner_stats.get('GHS 5s', 0) / 1000 # Convert GH/s to TH/s
+                temperature = miner_stats.get('temp1', 'N/A')
+                
+                stats_text = f"Hash: {hashrate:.2f} TH/s | Temp: {temperature}°C"
+                entry['stats_label'].config(text=stats_text, fg=self.text_white)
+            else:
+                entry['stats_label'].config(text="No stats available", fg=self.text_gray)
     
     def update_miner_stats(self, mac, total_hashrate, avg_hashrate):
         """Update hashrate statistics for a given miner card."""
@@ -357,6 +407,13 @@ class MinerIPReporterGUI:
             entry = self.miner_entries[mac]
             stats_text = f"Total: {total_hashrate:.2f} TH/s | Avg: {avg_hashrate:.2f} TH/s"
             entry['stats_label'].config(text=stats_text)
+
+    def _on_mouse_wheel(self, event):
+        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+    def _on_canvas_resize(self, event):
+        self.canvas.itemconfig(self.canvas.find_withtag("all")[0], width=event.width)
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
 
 
@@ -466,13 +523,15 @@ class MinerIPReporterGUI:
         # Create UI card
         if mac not in self.miner_entries:
             self.create_miner_card(mac, ip, time_str)
+            # Start a thread to fetch miner stats
+            threading.Thread(target=self._fetch_and_update_miner_stats, args=(mac, ip), daemon=True).start()
         
         self.update_stats()
     
     def create_miner_card(self, mac, ip, time_str):
         """Create miner card in UI."""
-        card = tk.Frame(self.miner_list_frame, bg=self.bg_card, padx=15, pady=12)
-        card.pack(fill="x", pady=5)
+        card = tk.Frame(self.scrollable_frame, bg=self.bg_card, bd=2, relief="groove")
+        card.pack(fill="x", padx=5, pady=5)
         
         info_frame = tk.Frame(card, bg=self.bg_card)
         info_frame.pack(side="left", fill="x", expand=True)
@@ -528,7 +587,16 @@ class MinerIPReporterGUI:
             bg=self.bg_card,
             fg=self.text_gray
         )
-        time_label.pack(anchor="w")
+        time_label.pack(anchor="w", pady=(0, 5))
+
+        stats_label = tk.Label(
+            info_frame,
+            text="Fetching stats...",
+            font=("Segoe UI", 9, "italic"),
+            bg=self.bg_card,
+            fg=self.text_gray
+        )
+        stats_label.pack(anchor="w")
         
         status_frame = tk.Frame(card, bg=self.bg_card)
         status_frame.pack(side="right", padx=10)
@@ -573,7 +641,8 @@ class MinerIPReporterGUI:
             'time_label': time_label,
             'visit_btn': visit_btn,
             'delete_btn': delete_btn, 
-            'miner_id': miner_id
+            'miner_id': miner_id,
+            'stats_label': stats_label
         }
     
     def open_browser(self, ip, mac):
@@ -631,4 +700,9 @@ def main():
     root.mainloop()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
