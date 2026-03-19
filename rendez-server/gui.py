@@ -12,7 +12,7 @@ import sys
 import json
 import asyncio
 import websockets
-from database import init_db, get_or_create_user, report_miner, mark_visited, get_collisions, insert_broadcast, get_roster, get_unvisited_miners, get_miner_reporters, get_user_display_name
+from database import init_db, get_or_create_user, report_miner, mark_visited, get_collisions, insert_broadcast, get_roster, get_unvisited_miners, get_miner_reporters, get_user_display_name, delete_miner
 
 # Import the listener functions from ip_listener
 sys.path.insert(0, '.')
@@ -342,6 +342,14 @@ class MinerIPReporterGUI:
             self.name_btn.config(text=f"Name: {self.display_name}")
             self.local_ip_label.config(text=f"Local: {self.local_ip} | Subnet: {self.subnet_prefix} | ID:{self.user_id}")
             print(f"Name updated to: {self.display_name}")
+
+    def delete_miner_entry(self, mac, miner_id):
+        if messagebox.askyesno("Delete Miner", f"Are you sure you want to delete the miner with MAC: {mac} and all its associated reports?"):
+            delete_miner(miner_id) 
+            self.miner_entries[mac]['frame'].destroy()
+            del self.miner_entries[mac]
+            self.update_stats()
+            messagebox.showinfo("Deleted", f"Miner {mac} and its reports have been deleted.")
     
     def update_miner_stats(self, mac, total_hashrate, avg_hashrate):
         """Update hashrate statistics for a given miner card."""
@@ -539,6 +547,21 @@ class MinerIPReporterGUI:
             command=lambda: self.open_browser(ip, mac)
         )
         visit_btn.pack()
+
+        delete_btn = tk.Button(
+            status_frame,
+            text="DELETE",
+            font=("Segoe UI", 10, "bold"),
+            bg="#cc3300", 
+            fg=self.text_white,
+            activebackground="#ff5533",
+            padx=15,
+            pady=5,
+            borderwidth=0,
+            cursor="hand2",
+            command=lambda: self.delete_miner_entry(mac, miner_id)
+        )
+        delete_btn.pack(pady=(5,0))
         
         self.miner_entries[mac] = {
             'ip': ip,
@@ -548,7 +571,9 @@ class MinerIPReporterGUI:
             'frame': card,
             'ip_label': ip_label,
             'time_label': time_label,
-            'visit_btn': visit_btn
+            'visit_btn': visit_btn,
+            'delete_btn': delete_btn, 
+            'miner_id': miner_id
         }
     
     def open_browser(self, ip, mac):
